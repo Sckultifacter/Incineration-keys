@@ -8,8 +8,12 @@ from plyer import notification
 import winreg  # Used to modify Windows Registry for Auto-Start
 import pystray
 from PIL import Image, ImageDraw
+import subprocess
+import ctypes
 
 import json
+import time
+import shlex
 
 # =========================================================
 #  ZONE 0: CONFIGURATION MANGER & VALIDATOR
@@ -17,7 +21,9 @@ import json
 class ConfigManager:
     DEFAULT_CONFIG = {
         "hotkeys": {
-            "Trigger Converter": "ctrl+alt+z"
+            "Trigger Converter": "ctrl+alt+z",
+            "Performance Mode": "ctrl+alt+g",
+            "Open": "ctrl+alt+s"
         },
         "run_on_startup": True
     }
@@ -29,6 +35,16 @@ class ConfigManager:
         if 'hotkey' in self.config:
             self.config['hotkeys'] = {"Trigger Converter": self.config['hotkey']}
             del self.config['hotkey']
+            self.save_config(self.config)
+        
+        # KEY MIGRATION: "Open Settings" -> "Open"
+        if 'hotkeys' in self.config and 'Open Settings' in self.config['hotkeys']:
+            # Only migrate if "Open" is missing
+            if 'Open' not in self.config['hotkeys']:
+                 self.config['hotkeys']['Open'] = self.config['hotkeys']['Open Settings']
+            
+            # Remove old key
+            del self.config['hotkeys']['Open Settings']
             self.save_config(self.config)
 
     def get_config_path(self):
@@ -44,17 +60,34 @@ class ConfigManager:
         try:
             with open(self.config_path, 'r') as f:
                 data = json.load(f)
+                updated = False
                 # Ensure structure integrity
                 if 'hotkeys' not in data:
                     data['hotkeys'] = self.DEFAULT_CONFIG['hotkeys'].copy()
+                    updated = True
+                else:
+                    # Merge missing defaults
+                    for key, val in self.DEFAULT_CONFIG['hotkeys'].items():
+                        if key not in data['hotkeys']:
+                            data['hotkeys'][key] = val
+                            updated = True
+                
+                if updated:
+                    self.save_config(data)
+                    
                 return data
         except:
             return self.DEFAULT_CONFIG.copy()
 
     def save_config(self, new_config):
-        self.config.update(new_config)
+        if hasattr(self, 'config'):
+            self.config.update(new_config)
+            data_to_save = self.config
+        else:
+            data_to_save = new_config
+            
         with open(self.config_path, 'w') as f:
-            json.dump(self.config, f, indent=4)
+            json.dump(data_to_save, f, indent=4)
 
     def get(self, key):
         return self.config.get(key, self.DEFAULT_CONFIG.get(key))
@@ -133,6 +166,74 @@ def convert_image_to_pdf(input_path):
     img_conv.save(output_path)
     return output_path
 
+# =========================================================
+#  ZONE 2.2: OSD MANAGER (Custom Notifications)
+# =========================================================
+class OSDManager:
+    def __init__(self, root):
+        self.root = root
+        self.osd_window = None
+
+    def show(self, text, title=None, duration=2000):
+        if self.osd_window:
+            try:
+                self.osd_window.destroy()
+            except:
+                pass
+        
+        # Create non-interactive window
+        self.osd_window = tk.Toplevel(self.root)
+        self.osd_window.overrideredirect(True)
+        self.osd_window.attributes('-topmost', True)
+        self.osd_window.configure(bg='black')
+        
+        # Rounded look via frame (approximate)
+        container = tk.Frame(self.osd_window, bg='#ff5500', padx=2, pady=2)
+        container.pack(fill='both', expand=True)
+        
+        inner = tk.Frame(container, bg='#151515', padx=30, pady=15)
+        inner.pack(fill='both', expand=True)
+
+        # Title (Optional)
+        if title:
+            tk.Label(inner, text=title.upper(), fg='#ff5500', bg='#151515', 
+                     font=('Segoe UI', 9, 'bold')).pack(anchor='w', pady=(0, 2))
+        
+        # Message
+        tk.Label(inner, text=text, fg='white', bg='#151515', 
+                 font=('Segoe UI', 11, 'bold')).pack(anchor='w')
+                 
+        # Centered Bottom positioning
+        self.osd_window.update_idletasks()
+        width = self.osd_window.winfo_width()
+        height = self.osd_window.winfo_height()
+        screen_width = self.osd_window.winfo_screenwidth()
+        screen_height = self.osd_window.winfo_screenheight()
+        
+        x = (screen_width // 2) - (width // 2)
+        y = screen_height - height - 100 # 100px from bottom
+        
+        self.osd_window.geometry(f'{width}x{height}+{x}+{y}')
+        
+        # Fade out / Destroy
+        self.root.after(duration, self.fade_out)
+
+    def fade_out(self):
+        if not self.osd_window: return
+        try:
+            alpha = self.osd_window.attributes('-alpha')
+            if alpha > 0:
+                alpha -= 0.1
+                self.osd_window.attributes('-alpha', alpha)
+                self.root.after(50, self.fade_out)
+            else:
+                self.osd_window.destroy()
+                self.osd_window = None
+        except:
+            if self.osd_window:
+                self.osd_window.destroy()
+                self.osd_window = None
+
 def convert_image_format(input_path, target_ext):
     from PIL import Image
     image = Image.open(input_path)
@@ -143,12 +244,255 @@ def convert_image_format(input_path, target_ext):
     return output_path
 
 # =========================================================
+#  ZONE 2.5: PERFORMANCE MODE MANAGER
+# =========================================================
+class PerformanceModeManager:
+    def __init__(self):
+        self.is_active = False
+        self.prev_power_guid = None
+        self.prev_visual_fx = None
+        self.prev_toast = 1
+        self.prev_brightness = None
+        self.temp_plan_created = False
+
+        # High Performance GUIDs
+        self.HP_GUID = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
+        self.ULTIMATE_GUID = "e9a42b02-d5df-448d-aa00-03f14749eb61"
+        self.INCINERATION_GUID = None # Will store our custom plan GUID
+        
+        # Popup suppression setup
+        self.startupinfo = subprocess.STARTUPINFO()
+        self.startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        self.startupinfo.wShowWindow = 0 # SW_HIDE
+        self.creation_flags = 0x08000000 # CREATE_NO_WINDOW
+
+    def _run_cmd(self, cmd):
+        try:
+            # Parse command string to list to avoid shell=True
+            args = shlex.split(cmd)
+            subprocess.run(
+                args, 
+                shell=False, 
+                stdout=subprocess.DEVNULL, 
+                stderr=subprocess.DEVNULL, 
+                stdin=subprocess.DEVNULL,
+                creationflags=self.creation_flags, 
+                startupinfo=self.startupinfo
+            )
+        except:
+            pass
+            
+    def _run_ps_output(self, cmd):
+        try:
+            # Run PowerShell command and get output
+            # Add -WindowStyle Hidden
+            # Run PowerShell command and get output
+            # Add -WindowStyle Hidden -NoProfile -NonInteractive
+            args = ["powershell", "-WindowStyle", "Hidden", "-NoProfile", "-NonInteractive", "-Command", cmd]
+            res = subprocess.check_output(
+                args, 
+                text=True, 
+                stdin=subprocess.DEVNULL,
+                creationflags=self.creation_flags,
+                startupinfo=self.startupinfo
+            ).strip()
+            return res
+        except:
+            return None
+
+    def _get_active_scheme(self):
+        try:
+            args = ["powercfg", "/getactivescheme"]
+            output = subprocess.check_output(
+                args, 
+                shell=False,
+                stdin=subprocess.DEVNULL,
+                creationflags=self.creation_flags,
+                startupinfo=self.startupinfo
+            ).decode()
+            # Output format: "Power Scheme GUID: <GUID>  (<Name>)"
+            return output.split("GUID:")[1].split()[0].strip()
+        except:
+            return None
+
+    def _plan_exists(self, guid):
+        try:
+            args = ["powercfg", "/list"]
+            output = subprocess.check_output(
+                args, 
+                shell=False,
+                stdin=subprocess.DEVNULL,
+                creationflags=self.creation_flags,
+                startupinfo=self.startupinfo
+            ).decode()
+            return guid in output
+        except:
+            return False
+
+    def _create_temp_plan(self, source_guid):
+        try:
+            # Duplicate the source plan
+            args = ["powercfg", "/duplicatescheme", source_guid]
+            output = subprocess.check_output(
+                args, 
+                shell=False,
+                stdin=subprocess.DEVNULL,
+                creationflags=self.creation_flags,
+                startupinfo=self.startupinfo
+            ).decode()
+            # Output: "Power Scheme GUID: <NEW_GUID>  (Copy of <Name>)"
+            new_guid = output.split("GUID:")[1].split()[0].strip()
+            
+            # Rename it
+            self._run_cmd(f"powercfg /changename {new_guid} \"Incineration Performance\"")
+            
+            # MODIFY SETTINGS
+            # 1. Processor Performance -> Min/Max to 100%
+            # GUIDs: SUB_PROCESSOR (54533251-82be-4824-96c1-47b60b740d00)
+            #        PROCTHROTTLEMIN (893dee8e-2bef-41e0-89c6-718607414d93)
+            #        PROCTHROTTLEMAX (bc5038f7-fd9e-4799-a217-a0f48b1b7520)
+            sub_proc = "54533251-82be-4824-96c1-47b60b740d00"
+            min_proc = "893dee8e-2bef-41e0-89c6-718607414d93"
+            max_proc = "bc5038f7-fd9e-4799-a217-a0f48b1b7520"
+            
+            self._run_cmd(f"powercfg /setacvalueindex {new_guid} {sub_proc} {min_proc} 100")
+            self._run_cmd(f"powercfg /setdcvalueindex {new_guid} {sub_proc} {min_proc} 100")
+            self._run_cmd(f"powercfg /setacvalueindex {new_guid} {sub_proc} {max_proc} 100")
+            self._run_cmd(f"powercfg /setdcvalueindex {new_guid} {sub_proc} {max_proc} 100")
+
+            # 2. PCI Express -> Link State Power Management -> Off (0)
+            # GUIDs: SUB_PCIEXPRESS (501a4d13-42af-401f-99da-3bcae46b6910)
+            #        ASPM (ee12f906-d1d7-4267-8d02-1de23b5c6d26)
+            sub_pci = "501a4d13-42af-401f-99da-3bcae46b6910"
+            aspm = "ee12f906-d1d7-4267-8d02-1de23b5c6d26"
+            
+            self._run_cmd(f"powercfg /setacvalueindex {new_guid} {sub_pci} {aspm} 0")
+            self._run_cmd(f"powercfg /setdcvalueindex {new_guid} {sub_pci} {aspm} 0")
+
+            # Activate changes
+            self._run_cmd(f"powercfg /setactive {new_guid}")
+            
+            return new_guid
+        except Exception as e:
+            print(f"Failed to create temp plan: {e}")
+            return None
+
+    def _get_registry_value(self, key_path, value_name):
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ)
+            val, _ = winreg.QueryValueEx(key, value_name)
+            winreg.CloseKey(key)
+            return val
+        except:
+            return None
+
+    def _set_registry_value(self, key_path, value_name, value, val_type=winreg.REG_DWORD):
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_WRITE)
+            winreg.SetValueEx(key, value_name, 0, val_type, value)
+            winreg.CloseKey(key)
+        except Exception as e:
+            print(f"Reg Error {key_path}: {e}")
+
+    def capture_state(self):
+        # 1. Power Plan
+        self.prev_power_guid = self._get_active_scheme()
+        if not self.prev_power_guid:
+            self.prev_power_guid = "381b4222-f694-41f0-9685-ff5bb260df2e" # Default Balanced fallback
+
+        # 2. Visual Effects
+        val = self._get_registry_value(r"Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects", "VisualFXSetting")
+        self.prev_visual_fx = val if val is not None else 3
+
+        # 3. Notifications (Focus Assist / Toast). Check multiple keys to be sure.
+        val = self._get_registry_value(r"Software\Microsoft\Windows\CurrentVersion\PushNotifications", "ToastEnabled")
+        self.prev_toast = val if val is not None else 1
+        
+        # 4. Brightness
+        try:
+            b = self._run_ps_output("(Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorBrightness).CurrentBrightness")
+            if b: self.prev_brightness = int(b)
+        except:
+            self.prev_brightness = 100 # Fallback
+
+    def enable(self):
+        self.is_active = True
+        self.capture_state()
+        self.temp_plan_created = False
+        
+        # 1. Power Plan Implementation
+        # Check if High Performance exists
+        if self._plan_exists(self.HP_GUID):
+            self._run_cmd(f"powercfg /setactive {self.HP_GUID}")
+        else:
+            # Create Custom Plan based on current valid plan
+            # We duplicate the active plan (which is likely Balanced or compatible with the hardware e.g. Modern Standby)
+            self.INCINERATION_GUID = self._create_temp_plan(self.prev_power_guid)
+            if self.INCINERATION_GUID:
+                self.temp_plan_created = True
+        
+        # 2. Visual Effects -> Best Performance (2)
+        self._set_registry_value(r"Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects", "VisualFXSetting", 2)
+        
+        # 3. Notifications -> Off (0)
+        self._set_registry_value(r"Software\Microsoft\Windows\CurrentVersion\PushNotifications", "ToastEnabled", 0)
+        self._set_registry_value(r"Software\Microsoft\Windows\CurrentVersion\Notifications\Settings", "NOC_GLOBAL_SETTING_TOAST_ENABLED_KEY", 0)
+        
+        # 4. Game Mode -> On (1)
+        self._set_registry_value(r"Software\Microsoft\GameBar", "AllowAutoGameMode", 1)
+        
+        # 5. Restore Brightness Forcefully (after a short delay to allow power plan to settle)
+        if self.prev_brightness is not None:
+             time.sleep(0.5) 
+             cmd = f"(Get-WmiObject -Namespace root/wmi -Class WmiMonitorBrightnessMethods).WmiSetBrightness(1, {self.prev_brightness})"
+             self._run_ps_output(cmd)
+
+        user32 = ctypes.windll.user32
+        user32.SystemParametersInfoW(0x0049, 0, 0, 0x02 | 0x01) 
+        
+        # Notify
+        # Note: Notification is handled by the caller, but we return success status if needed
+
+    def disable(self):
+        self.is_active = False
+        
+        # 1. Restore Power Plan
+        if self.prev_power_guid:
+            self._run_cmd(f"powercfg /setactive {self.prev_power_guid}")
+            
+        # Cleanup temporary plan
+        if self.temp_plan_created and self.INCINERATION_GUID:
+            time.sleep(0.5) # Wait for switch to complete
+            self._run_cmd(f"powercfg /delete {self.INCINERATION_GUID}")
+            self.INCINERATION_GUID = None
+            self.temp_plan_created = False
+        
+        # 2. Restore Visual Effects
+        if self.prev_visual_fx is not None:
+             self._set_registry_value(r"Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects", "VisualFXSetting", self.prev_visual_fx)
+        
+        # 3. Restore Notifications
+        if self.prev_toast is not None:
+            self._set_registry_value(r"Software\Microsoft\Windows\CurrentVersion\PushNotifications", "ToastEnabled", self.prev_toast)
+            self._set_registry_value(r"Software\Microsoft\Windows\CurrentVersion\Notifications\Settings", "NOC_GLOBAL_SETTING_TOAST_ENABLED_KEY", self.prev_toast)
+
+        # 4. Restore Brightness
+        if self.prev_brightness is not None:
+             time.sleep(0.5)
+             cmd = f"(Get-WmiObject -Namespace root/wmi -Class WmiMonitorBrightnessMethods).WmiSetBrightness(1, {self.prev_brightness})"
+             self._run_ps_output(cmd)
+
+        user32 = ctypes.windll.user32
+        user32.SystemParametersInfoW(0x0049, 0, 0, 0x02 | 0x01)
+
+# =========================================================
 #  ZONE 3: THE CORE ENGINE
 # =========================================================
 
 class AntigravityEngine:
     def __init__(self):
         self.config_manager = ConfigManager()
+        self.performance_manager = PerformanceModeManager()
         
         # 1. Startup Check
         if self.config_manager.get('run_on_startup'):
@@ -156,9 +500,11 @@ class AntigravityEngine:
         else:
             self.remove_startup()
         
-        # 2. Setup Hidden UI (Required for dialogs)
         self.root = tk.Tk()
         self.root.withdraw()
+        
+        # 2.1 OSD Manager
+        self.osd = OSDManager(self.root)
         
         # 3. Setup System Tray
         self.setup_tray()
@@ -192,6 +538,18 @@ class AntigravityEngine:
                         print(f"Registered '{action_name}' to {hotkey}")
                     except Exception as e:
                         print(f"Failed to register '{action_name}': {e}")
+                elif action_name == "Performance Mode":
+                    try:
+                        keyboard.add_hotkey(hotkey, lambda: self.safe_trigger(self.toggle_performance_mode))
+                        print(f"Registered '{action_name}' to {hotkey}")
+                    except Exception as e:
+                        print(f"Failed to register '{action_name}': {e}")
+                elif action_name == "Open":
+                    try:
+                        keyboard.add_hotkey(hotkey, lambda: self.safe_trigger(self.open_settings_window))
+                        print(f"Registered '{action_name}' to {hotkey}")
+                    except Exception as e:
+                        print(f"Failed to register '{action_name}': {e}")
         except Exception as e:
             print(f"Failed to load hotkeys: {e}")
 
@@ -209,13 +567,13 @@ class AntigravityEngine:
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_ALL_ACCESS)
             try:
                 existing, _ = winreg.QueryValueEx(key, app_name)
-                if existing == app_path:
+                if existing == f'"{app_path}"':
                     winreg.CloseKey(key)
                     return # Already installed
             except FileNotFoundError:
                 pass
 
-            winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ, app_path)
+            winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ, f'"{app_path}"')
             winreg.CloseKey(key)
         except Exception as e:
             print(f"Startup Error: {e}")
@@ -274,16 +632,13 @@ class AntigravityEngine:
         if hasattr(self, 'icon'):
             self.icon.stop()
         self.root.quit()
-        sys.exit(0)
+        os._exit(0)
 
     def safe_trigger(self, func):
         self.root.after(0, func)
 
     def notify(self, title, msg):
-        try:
-            notification.notify(title=title, message=msg, timeout=3)
-        except:
-            pass
+        self.safe_trigger(lambda: self.osd.show(text=msg, title=title, duration=3000))
 
     # --- ADVANCED SETTINGS UI ---
     def open_settings_window(self):
@@ -523,6 +878,14 @@ class AntigravityEngine:
             self.notify("Success", "File converted.")
         except Exception as e:
             self.notify("Error", str(e))
+
+    def toggle_performance_mode(self):
+        if self.performance_manager.is_active:
+            self.performance_manager.disable()
+            self.osd.show(text="Default", title="SYSTEM MODE", duration=2500)
+        else:
+            self.performance_manager.enable()
+            self.osd.show(text="Performance Mode", title="SYSTEM MODE", duration=3000)
 
 if __name__ == "__main__":
     AntigravityEngine()

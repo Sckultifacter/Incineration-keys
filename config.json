@@ -1,6 +1,8 @@
 {
     "hotkeys": {
-        "Trigger Converter": "ctrl+alt+z"
+        "Trigger Converter": "ctrl+alt+z",
+        "Performance Mode": "ctrl+alt+p",
+        "Open": "ctrl+alt+o"
     },
     "run_on_startup": true
 }
