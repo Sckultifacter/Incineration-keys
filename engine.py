@@ -743,23 +743,77 @@ class AntigravityEngine:
         # Actually hooking is messy. Let's use prompts or focus binding.
         # RE-PLAN: Use a simplified "Dialog" approach for recording or just `keyboard.read_hotkey` in thread.
     
-    # RE-IMPLEMENTING start_recording safer
+    # RE-IMPLEMENTING start_recording with robust hooks to avoid phantom keys
     def start_recording(self, btn, string_var, action_name):
         btn.config(text="Listening...", bg="#ff5500", fg="white")
-        Thread(target=self._record_thread, args=(btn, string_var, action_name)).start()
-
-    def _record_thread(self, btn, string_var, action_name):
+        
+        # Reset state
+        self.rec_current_keys = set()
+        self.rec_max_keys = set()
+        self.rec_btn = btn
+        self.rec_var = string_var
+        
+        # Disable hotkeys temporarily to prevent triggering while recording?
+        # For now, just hook.
         try:
-            # This blocks until a hotkey is pressed
-            hotkey = keyboard.read_hotkey(suppress=False)
-            # Update UI from thread
-            self.root.after(0, lambda: self._finish_recording(btn, string_var, hotkey))
-        except Exception:
-            self.root.after(0, lambda: self._finish_recording(btn, string_var, "Error"))
+             self.rec_hook = keyboard.hook(self._on_record_event)
+        except Exception as e:
+             self.notify("Error", f"Failed to hook keyboard: {e}")
+             self._finalize_recording("Error")
 
-    def _finish_recording(self, btn, string_var, hotkey):
-        btn.config(bg="#222", fg="white")
-        string_var.set(hotkey)
+    def _on_record_event(self, e):
+        if e.event_type == keyboard.KEY_DOWN:
+            key = e.name.lower()
+            if key in ['control', 'right control']: key = 'ctrl'
+            if key in ['shift', 'right shift']: key = 'shift'
+            if key in ['alt', 'right alt']: key = 'alt'
+            if key in ['windows', 'left windows', 'right windows']: key = 'win'
+            
+            self.rec_current_keys.add(key)
+            # Update max set if current is larger (to capture full combo)
+            if len(self.rec_current_keys) > len(self.rec_max_keys):
+                self.rec_max_keys = self.rec_current_keys.copy()
+            
+            # Live Update UI
+            self.root.after(0, lambda: self.rec_btn.config(text="+".join(sorted(self.rec_current_keys))))
+
+        elif e.event_type == keyboard.KEY_UP:
+            key = e.name.lower()
+            if key in ['control', 'right control']: key = 'ctrl'
+            if key in ['shift', 'right shift']: key = 'shift'
+            if key in ['alt', 'right alt']: key = 'alt'
+            if key in ['windows', 'left windows', 'right windows']: key = 'win'
+            
+            if key in self.rec_current_keys:
+                self.rec_current_keys.remove(key)
+            
+            # If all keys released, finalize
+            if not self.rec_current_keys:
+                self.root.after(0, self._finalize_recording)
+
+    def _finalize_recording(self, error_val=None):
+        try:
+            keyboard.unhook(self.rec_hook)
+        except:
+            pass
+            
+        if error_val:
+            final_hotkey = error_val
+        elif not self.rec_max_keys:
+            final_hotkey = self.rec_var.get() # Restore old if nothing pressed
+        else:
+            # Construct hotkey string from max_keys
+            # Sort order: ctrl, alt, shift, win, others
+            keys = list(self.rec_max_keys)
+            priority = {'ctrl': 0, 'alt': 1, 'shift': 2, 'win': 3}
+            
+            mods = sorted([k for k in keys if k in priority], key=lambda x: priority[x])
+            others = sorted([k for k in keys if k not in priority])
+            
+            final_hotkey = "+".join(mods + others)
+            
+        self.rec_var.set(final_hotkey)
+        self.rec_btn.config(text=final_hotkey, bg="#222", fg="white")
 
     def save_settings(self):
         new_hotkeys = {}
@@ -880,12 +934,16 @@ class AntigravityEngine:
             self.notify("Error", str(e))
 
     def toggle_performance_mode(self):
-        if self.performance_manager.is_active:
-            self.performance_manager.disable()
-            self.osd.show(text="Default", title="SYSTEM MODE", duration=2500)
-        else:
-            self.performance_manager.enable()
-            self.osd.show(text="Performance Mode", title="SYSTEM MODE", duration=3000)
+        try:
+            if self.performance_manager.is_active:
+                self.performance_manager.disable()
+                self.osd.show(text="Default", title="SYSTEM MODE", duration=2500)
+            else:
+                self.performance_manager.enable()
+                self.osd.show(text="Performance Mode", title="SYSTEM MODE", duration=3000)
+        except Exception as e:
+            self.notify("Mode Error", str(e))
+            print(f"Performance Toggle Failed: {e}")
 
 if __name__ == "__main__":
     AntigravityEngine()
