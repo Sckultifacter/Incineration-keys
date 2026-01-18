@@ -12,6 +12,7 @@ import subprocess
 import ctypes
 
 import json
+import shutil
 import time
 import shlex
 
@@ -23,7 +24,8 @@ class ConfigManager:
         "hotkeys": {
             "Trigger Converter": "ctrl+alt+z",
             "Performance Mode": "ctrl+alt+g",
-            "Open": "ctrl+alt+s"
+            "Open": "ctrl+alt+s",
+            "Clean Temp": "ctrl+a+delete"
         },
         "run_on_startup": True
     }
@@ -447,8 +449,7 @@ class PerformanceModeManager:
              cmd = f"(Get-WmiObject -Namespace root/wmi -Class WmiMonitorBrightnessMethods).WmiSetBrightness(1, {self.prev_brightness})"
              self._run_ps_output(cmd)
 
-        user32 = ctypes.windll.user32
-        user32.SystemParametersInfoW(0x0049, 0, 0, 0x02 | 0x01) 
+        self._toggle_animations(False) # Turn OFF animations
         
         # Notify
         # Note: Notification is handled by the caller, but we return success status if needed
@@ -476,14 +477,44 @@ class PerformanceModeManager:
             self._set_registry_value(r"Software\Microsoft\Windows\CurrentVersion\PushNotifications", "ToastEnabled", self.prev_toast)
             self._set_registry_value(r"Software\Microsoft\Windows\CurrentVersion\Notifications\Settings", "NOC_GLOBAL_SETTING_TOAST_ENABLED_KEY", self.prev_toast)
 
-        # 4. Restore Brightness
         if self.prev_brightness is not None:
              time.sleep(0.5)
              cmd = f"(Get-WmiObject -Namespace root/wmi -Class WmiMonitorBrightnessMethods).WmiSetBrightness(1, {self.prev_brightness})"
              self._run_ps_output(cmd)
 
         user32 = ctypes.windll.user32
-        user32.SystemParametersInfoW(0x0049, 0, 0, 0x02 | 0x01)
+        user32.SystemParametersInfoW(0x0049, 0, 0, 0x02 | 0x01) # Reset (though toggling handles it better)
+        self._toggle_animations(True) # Turn ON animations
+
+    def _toggle_animations(self, enable_anim):
+        user32 = ctypes.windll.user32
+        # SPI_SETCLIENTAREAANIMATION = 0x1043
+        # SPI_SETANIMATION = 0x0049
+        # SPI_SETCOMBOBOXANIMATION = 0x1005
+        # SPI_SETLISTBOXSMOOTHSCROLLING = 0x1007
+        # SPI_SETMENUANIMATION = 0x1003
+        # SPI_SETMENUFADE = 0x1013
+        # SPI_SETSELECTIONFADE = 0x1015
+        # SPI_SETTOOLTIPANIMATION = 0x1017
+        # SPI_SETUIEFFECTS = 0x103F
+        
+        flags = [0x1043, 0x0049, 0x1005, 0x1007, 0x1003, 0x1013, 0x1015, 0x1017, 0x103F]
+        
+        # Structure for SPI_SETANIMATION ( ANIMATIONINFO )
+        class ANIMATIONINFO(ctypes.Structure):
+            _fields_ = [("cbSize", ctypes.c_uint), ("iMinAnimate", ctypes.c_int)]
+            
+        anim_info = ANIMATIONINFO()
+        anim_info.cbSize = ctypes.sizeof(ANIMATIONINFO)
+        anim_info.iMinAnimate = 1 if enable_anim else 0
+        
+        val = 1 if enable_anim else 0
+        
+        for flag in flags:
+            if flag == 0x0049: # SPI_SETANIMATION requires structure? No, simple bool usually works for toggle, but let's be safe
+               user32.SystemParametersInfoW(flag, 0, ctypes.byref(anim_info), 0x02 | 0x01)
+            else:
+               user32.SystemParametersInfoW(flag, 0, val, 0x02 | 0x01)
 
 # =========================================================
 #  ZONE 3: THE CORE ENGINE
@@ -541,6 +572,12 @@ class AntigravityEngine:
                 elif action_name == "Performance Mode":
                     try:
                         keyboard.add_hotkey(hotkey, lambda: self.safe_trigger(self.toggle_performance_mode))
+                        print(f"Registered '{action_name}' to {hotkey}")
+                    except Exception as e:
+                        print(f"Failed to register '{action_name}': {e}")
+                elif action_name == "Clean Temp":
+                    try:
+                        keyboard.add_hotkey(hotkey, lambda: self.safe_trigger(self.clean_temp_files))
                         print(f"Registered '{action_name}' to {hotkey}")
                     except Exception as e:
                         print(f"Failed to register '{action_name}': {e}")
@@ -648,7 +685,7 @@ class AntigravityEngine:
 
         self.settings_win = tk.Toplevel(self.root)
         self.settings_win.title("Incineration Settings")
-        self.settings_win.geometry("500x450")
+        self.settings_win.geometry("600x550") # Increased height for new buttons
         self.settings_win.configure(bg="#121212")
         
         # Header
@@ -693,12 +730,29 @@ class AntigravityEngine:
 
         # Action Buttons
         btn_frame = tk.Frame(self.settings_win, bg="#121212")
-        btn_frame.pack(side='bottom', pady=30)
+        btn_frame.pack(side='bottom', pady=20, fill='x', padx=20)
         
-        tk.Button(btn_frame, text="APPLY CHANGES", command=self.save_settings, 
-                  bg="#ff5500", fg="white", relief="flat", font=("Segoe UI", 10, "bold"), padx=25, pady=8).pack(side="left", padx=10)
-        tk.Button(btn_frame, text="CANCEL", command=self.settings_win.destroy, 
-                  bg="#222", fg="#aaa", relief="flat", font=("Segoe UI", 10), padx=25, pady=8).pack(side="left", padx=10)
+        # Details: Use variables to bind events
+        btn_apply = tk.Button(btn_frame, text="APPLY CHANGES", command=self.save_settings, 
+                  bg="#ff5500", fg="white", relief="flat", font=("Segoe UI", 11, "bold"), 
+                  padx=30, pady=10, cursor="hand2", activebackground="#cc4400", activeforeground="white")
+        btn_apply.pack(side="right", padx=10)
+        
+        btn_cancel = tk.Button(btn_frame, text="CANCEL", command=self.settings_win.destroy, 
+                  bg="#222", fg="#aaa", relief="flat", font=("Segoe UI", 11), 
+                  padx=30, pady=10, cursor="hand2", activebackground="#333", activeforeground="#ccc")
+        btn_cancel.pack(side="right", padx=10)
+
+        # Hover Effects
+        def on_enter_apply(e): btn_apply['bg'] = '#ff7722'
+        def on_leave_apply(e): btn_apply['bg'] = '#ff5500'
+        btn_apply.bind("<Enter>", on_enter_apply)
+        btn_apply.bind("<Leave>", on_leave_apply)
+
+        def on_enter_cancel(e): btn_cancel['bg'] = '#333'; btn_cancel['fg'] = 'white'
+        def on_leave_cancel(e): btn_cancel['bg'] = '#222'; btn_cancel['fg'] = '#aaa'
+        btn_cancel.bind("<Enter>", on_enter_cancel)
+        btn_cancel.bind("<Leave>", on_leave_cancel)
 
     def start_recording(self, btn, string_var, action_name):
         btn.config(text="Press Keys...", bg="#ff5500", fg="white")
@@ -944,6 +998,41 @@ class AntigravityEngine:
         except Exception as e:
             self.notify("Mode Error", str(e))
             print(f"Performance Toggle Failed: {e}")
+
+    def clean_temp_files(self):
+        self.notify("Incinerator", "Cleaning Temp Files...")
+        
+        temp_dir = os.environ.get('TEMP')
+        if not temp_dir:
+            self.notify("Error", "Could not find TEMP folder.")
+            return
+
+        deleted_files = 0
+        deleted_dirs = 0
+        errors = 0
+
+        # Run in thread to prevent freezing UI
+        def _clean_worker():
+            nonlocal deleted_files, deleted_dirs, errors
+            try:
+                # Walk top-level to avoid deep recursion issues if any
+                for item in os.listdir(temp_dir):
+                    item_path = os.path.join(temp_dir, item)
+                    try:
+                        if os.path.isfile(item_path) or os.path.islink(item_path):
+                            os.unlink(item_path)
+                            deleted_files += 1
+                        elif os.path.isdir(item_path):
+                            shutil.rmtree(item_path)
+                            deleted_dirs += 1
+                    except Exception:
+                        errors += 1
+                
+                self.safe_trigger(lambda: self.notify("Incinerator", f"Incinerated {deleted_files} files & {deleted_dirs} folders. ({errors} skipped)"))
+            except Exception as e:
+                self.safe_trigger(lambda: self.notify("Error", f"Failed to clean: {e}"))
+
+        Thread(target=_clean_worker).start()
 
 if __name__ == "__main__":
     AntigravityEngine()
