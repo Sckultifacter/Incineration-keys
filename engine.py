@@ -30,8 +30,7 @@ class ConfigManager:
             "Clean Temp": "ctrl+a+delete",
             "Incinerator Drop": "ctrl+alt+d"
         },
-        "run_on_startup": True,
-        "ngrok_token": "" 
+        "run_on_startup": True
     }
     
     def __init__(self):
@@ -77,6 +76,12 @@ class ConfigManager:
                         if key not in data['hotkeys']:
                             data['hotkeys'][key] = val
                             updated = True
+                
+                # Merge top-level missing keys
+                for key, val in self.DEFAULT_CONFIG.items():
+                    if key not in data and key != 'hotkeys':
+                        data[key] = val
+                        updated = True
                 
                 if updated:
                     self.save_config(data)
@@ -180,7 +185,7 @@ class OSDManager:
         self.root = root
         self.osd_window = None
 
-    def show(self, text, title=None, duration=2000):
+    def show(self, text, title=None, duration=3000):
         if self.osd_window:
             try:
                 self.osd_window.destroy()
@@ -191,23 +196,49 @@ class OSDManager:
         self.osd_window = tk.Toplevel(self.root)
         self.osd_window.overrideredirect(True)
         self.osd_window.attributes('-topmost', True)
-        self.osd_window.configure(bg='black')
         
-        # Rounded look via frame (approximate)
-        container = tk.Frame(self.osd_window, bg='#ff5500', padx=2, pady=2)
-        container.pack(fill='both', expand=True)
+        bg_color = "#252526" # Dark Grey
+        self.osd_window.configure(bg=bg_color)
         
-        inner = tk.Frame(container, bg='#151515', padx=30, pady=15)
-        inner.pack(fill='both', expand=True)
+        # Main Layout Frame
+        frame = tk.Frame(self.osd_window, bg=bg_color, padx=20, pady=15)
+        frame.pack()
+        
+        # 1. Icon (Canvas)
+        icon_size = 36
+        canvas = tk.Canvas(frame, width=icon_size, height=icon_size, bg=bg_color, highlightthickness=0)
+        canvas.pack(side='left', padx=(0, 15))
+        
+        # Determine Status Concept
+        is_error = title and "error" in title.lower()
+        if not title: title = "Info"
+        
+        # Circle Color
+        fill_color = "#e53935" if is_error else "#4caf50" # Material Red or Green
+        
+        # Draw Circle
+        canvas.create_oval(2, 2, icon_size-2, icon_size-2, fill=fill_color, outline=fill_color)
+        
+        if is_error:
+            # Draw X
+            canvas.create_line(10, 10, 26, 26, fill='white', width=3, capstyle=tk.ROUND)
+            canvas.create_line(10, 26, 26, 10, fill='white', width=3, capstyle=tk.ROUND)
+        else:
+            # Draw Check
+            canvas.create_line(9, 18, 16, 25, fill='white', width=3, capstyle=tk.ROUND)
+            canvas.create_line(16, 25, 27, 11, fill='white', width=3, capstyle=tk.ROUND)
 
-        # Title (Optional)
-        if title:
-            tk.Label(inner, text=title.upper(), fg='#ff5500', bg='#151515', 
-                     font=('Segoe UI', 9, 'bold')).pack(anchor='w', pady=(0, 2))
+        # 2. Text Column
+        text_frame = tk.Frame(frame, bg=bg_color)
+        text_frame.pack(side='left', fill='both')
+
+        # Title
+        tk.Label(text_frame, text=title.upper(), fg='#ff9800', bg=bg_color, 
+                 font=('Segoe UI', 13, 'bold')).pack(anchor='w', pady=(0, 2))
         
         # Message
-        tk.Label(inner, text=text, fg='white', bg='#151515', 
-                 font=('Segoe UI', 11, 'bold')).pack(anchor='w')
+        tk.Label(text_frame, text=text, fg='white', bg=bg_color, 
+                 font=('Segoe UI', 11)).pack(anchor='w')
                  
         # Centered Bottom positioning
         self.osd_window.update_idletasks()
@@ -217,7 +248,7 @@ class OSDManager:
         screen_height = self.osd_window.winfo_screenheight()
         
         x = (screen_width // 2) - (width // 2)
-        y = screen_height - height - 100 # 100px from bottom
+        y = screen_height - height - 120 # 120px from bottom
         
         self.osd_window.geometry(f'{width}x{height}+{x}+{y}')
         
@@ -552,7 +583,7 @@ class AirDropManager:
         qr.make(fit=True)
         return qr.make_image(fill_color="black", back_color="white")
 
-    def start_server(self, mode, files=None, use_global=False, ngrok_token=None):
+    def start_server(self, mode, files=None):
         from flask import Flask, send_file, request, render_template_string, abort, session, redirect, url_for
         import logging
         import random
@@ -566,7 +597,7 @@ class AirDropManager:
         self.files_map = {os.path.basename(f): f for f in self.files_to_send}
         self.server_running = True
         self.public_url = None
-        self.pin = str(random.randint(1000, 9999))
+        self.public_url = None
         
         if not os.path.exists(self.upload_dir):
             os.makedirs(self.upload_dir)
@@ -575,23 +606,7 @@ class AirDropManager:
         app.secret_key = os.urandom(24)
         self.app = app
 
-        @app.before_request
-        def require_login():
-            if request.endpoint == 'static': return
-            if request.endpoint == 'login': return
-            
-            if 'authenticated' not in session:
-                return redirect(url_for('login'))
 
-        @app.route('/login', methods=['GET', 'POST'])
-        def login():
-            if request.method == 'POST':
-                if request.form.get('pin') == self.pin:
-                    session['authenticated'] = True
-                    return redirect(url_for('index'))
-                else:
-                    return render_template_string(self._get_login_html(error="Invalid PIN"))
-            return render_template_string(self._get_login_html())
 
         @app.route('/')
         def index():
@@ -677,32 +692,11 @@ class AirDropManager:
             <p style="text-align:center;"><a href="/" style="color:white;">Send More</a></p>
             """
         
-        return self._run_server_thread(use_global, ngrok_token)
+        return self._run_server_thread()
 
-    def _get_login_html(self, error=""):
-        return f"""
-        <!doctype html>
-        <html style="background:#121212; color:white; font-family:sans-serif; text-align:center; padding:50px;">
-        <head><meta name="viewport" content="width=device-width, initial-scale=1"></head>
-        <body>
-            <h1 style="color:#ff5500;">SECURE LOGIN</h1>
-            <p style="color:#888;">Enter the 4-digit PIN shown on the Host PC.</p>
-            <form method="post" style="margin-top:20px;">
-                <input type="number" name="pin" placeholder="PIN" 
-                       style="padding:10px; font-size:20px; width:100px; text-align:center; border-radius:5px; border:none;">
-                <br><br>
-                <button type="submit" 
-                        style="background:#ff5500; color:white; border:none; padding:10px 30px; 
-                               font-size:16px; border-radius:5px; cursor:pointer;">
-                    ENTER
-                </button>
-            </form>
-            <p style="color:red; margin-top:20px;">{error}</p>
-        </body>
-        </html>
-        """
 
-    def _run_server_thread(self, use_global, ngrok_token):
+
+    def _run_server_thread(self):
         def run_app():
             try:
                 # Run on 0.0.0.0 to be accessible
@@ -713,37 +707,11 @@ class AirDropManager:
         self.server_thread = Thread(target=run_app, daemon=True)
         self.server_thread.start()
         
-        if use_global:
-            try:
-                from pyngrok import ngrok
-                
-                # Apply Token
-                if ngrok_token:
-                    ngrok.set_auth_token(ngrok_token)
-                
-                # Open a HTTP tunnel on the default port 8000
-                tunnel = ngrok.connect(self.port)
-                self.public_url = tunnel.public_url
-                return self.public_url
-            except Exception as e:
-                print(f"Ngrok Error: {e}")
-                self.notify(self.root, "Error", "Global tunnel failed. Check Token.")
-        
         ip = self.get_local_ip()
         return f"http://{ip}:{self.port}"
 
     def stop_server(self):
         self.server_running = False
-        
-        # Kill ngrok tunnel
-        if self.public_url:
-            try:
-                from pyngrok import ngrok
-                ngrok.disconnect(self.public_url)
-                ngrok.kill() # Ensure process is killed
-                self.public_url = None
-            except:
-                pass
 
 # =========================================================
 #  ZONE 3: THE CORE ENGINE
@@ -962,12 +930,10 @@ class AntigravityEngine:
                             bg="#121212", fg="#e0e0e0", selectcolor="#222", activebackground="#121212", activeforeground="white", font=("Segoe UI", 10))
         cb.pack(side='left')
 
+        self.lbl_error = tk.Label(self.settings_win, text="", fg="red", bg="#121212", font=("Segoe UI", 9))
         self.lbl_error.pack(pady=(10, 0))
 
-        # Ngrok Token Section
-        tk.Label(self.settings_win, text="Ngrok Authtoken (For Global Mode)", bg="#121212", fg="#888", font=("Segoe UI", 9)).pack(anchor='w', padx=20, pady=(10,0))
-        self.var_token = tk.StringVar(value=self.config_manager.get('ngrok_token'))
-        tk.Entry(self.settings_win, textvariable=self.var_token, bg="#222", fg="white", insertbackground="white", relief="flat", font=("Consolas", 10)).pack(fill='x', padx=20, pady=5)
+
 
         # Action Buttons
         btn_frame = tk.Frame(self.settings_win, bg="#121212")
@@ -1128,12 +1094,12 @@ class AntigravityEngine:
 
         # 3. Save
         run_startup = self.var_startup.get()
-        token = self.var_token.get().strip()
+
         
         self.config_manager.save_config({
             "hotkeys": new_hotkeys,
             "run_on_startup": run_startup,
-            "ngrok_token": token
+            "run_on_startup": run_startup
         })
         
         # 4. Apply
@@ -1243,6 +1209,7 @@ class AntigravityEngine:
         x, y = self.root.winfo_pointerx(), self.root.winfo_pointery()
         popup.geometry(f"+{x}+{y}")
         
+        # Border
         container = tk.Frame(popup, bg="#ff5500", padx=2, pady=2)
         container.pack(fill="both", expand=True)
         inner = tk.Frame(container, bg="#101010", padx=20, pady=20)
@@ -1250,22 +1217,16 @@ class AntigravityEngine:
         
         tk.Label(inner, text="INCINERATOR DROP", bg='#101010', fg='#666', font=('Segoe UI', 9, 'bold')).pack(pady=(0, 10))
 
-        # Global Mode Toggle
-        var_global = tk.BooleanVar(value=False)
-        cb_global = tk.Checkbutton(inner, text="Allow Global Access (Internet)", variable=var_global,
-                                   bg='#101010', fg='#888', selectcolor='#222', activebackground='#101010', activeforeground='white',
-                                   font=('Segoe UI', 9))
-        cb_global.pack(pady=(0, 10))
-
+        # Buttons
         def start_send():
             popup.destroy()
             file_paths = filedialog.askopenfilenames(title="Select File(s) to Send")
             if file_paths:
-                self.start_airdrop_session("SEND", file_paths, var_global.get())
+                self.start_airdrop_session("SEND", file_paths)
                 
         def start_recv():
             popup.destroy()
-            self.start_airdrop_session("RECEIVE", None, var_global.get())
+            self.start_airdrop_session("RECEIVE", None)
 
         tk.Button(inner, text="SEND FILE (PC -> PHONE)", command=start_send,
                   bg='#202020', fg='white', relief='flat', padx=30, pady=8, font=('Segoe UI', 10)).pack(fill='x', pady=2)
@@ -1279,33 +1240,17 @@ class AntigravityEngine:
         popup.bind("<FocusOut>", lambda e: popup.destroy())
         popup.after(100, popup.focus_force)
 
-    def start_airdrop_session(self, mode, file_path=None, use_global=False):
+    def start_airdrop_session(self, mode, file_path=None):
         try:
-            token = self.config_manager.get('ngrok_token')
-            url = self.airdrop.start_server(mode, file_path, use_global, token)
-            # Use the actual wrapper method instead of direct implementation in start_server (fixing partial replacement issue)
-            # Actually I made a mistake in replacement above, I defined _run_server_thread but didn't call it. 
-            # Correction: start_server should call _run_server_thread.
-            # Let me fix the start_server structure in the next tool call if needed or inline it here.
-            # Wait, the previous chunk REPLACED the bottom of start_server with helper methods but didn't hook them up?
-            # Ah, I replaced the BODY execution. 
-            # Let's fix start_server to delegate to _run_server_thread in a separate fix step if I broke it.
-            # Actually, looking at chunk 5, I replaced the END of start_server (helper defs) but didn't change the return.
-            # I must fix start_server to actually use _run_server_thread.
-            pass # Placeholder for thought process.
-            
-            # The previous chunk 5 defines `_run_server_thread` inside class scope or start_server scope?
-            # It replaced `def run_app(): ... return` block.
-            # So `start_server` now contains `_get_login_html` and `_run_server_thread` but doesn't CALL them?
-            # This is risky. I should do a clean Replace of the whole method in next step.
-            
+            # Reverted to Local Only
+            url = self.airdrop.start_server(mode, file_path)
             self.show_airdrop_qr(url, mode)
         except Exception as e:
             self.notify("Error", f"Failed to start: {e}")
 
     def show_airdrop_qr(self, url, mode):
         qr_img = self.airdrop.generate_qr(url)
-        pin = self.airdrop.pin
+        qr_img = self.airdrop.generate_qr(url)
         
         # Display QR
         qr_win = tk.Toplevel(self.root)
@@ -1322,7 +1267,7 @@ class AntigravityEngine:
         tk.Label(qr_win, text="SCAN TO " + mode, bg="#121212", fg="#ff5500", font=("Segoe UI", 14, "bold")).pack(pady=(20, 5))
         
         # PIN Display
-        tk.Label(qr_win, text=f"PIN: {pin}", bg="#121212", fg="white", font=("Consolas", 24, "bold")).pack(pady=(0, 10))
+
         
         # Convert PIL to PhotoImage
         from PIL import ImageTk
