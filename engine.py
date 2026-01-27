@@ -151,13 +151,102 @@ def convert_docx_to_pdf(input_path):
     convert(input_path, output_path)
     return output_path
 
-def convert_pdf_to_docx(input_path):
+def is_text_based_pdf(input_path):
+    try:
+        import fitz
+        doc = fitz.open(input_path)
+        text_length = 0
+        # Check first 3 pages
+        for i in range(min(3, len(doc))):
+            text_length += len(doc[i].get_text())
+        return text_length > 100 # Threshold: if >100 chars, likely native PDF
+    except:
+        return False
+
+def convert_pdf_to_docx_smart(input_path):
+    # User feedback indicates pdf2docx (Layout) fails on complex backgrounds/sidebars.
+    # Microsoft Word's Reflow engine handles both text-based and scanned PDFs
+    # with much higher visual fidelity while still keeping text editable.
+    # We will force the High-Fidelity Word engine for everything.
+    return convert_pdf_to_docx_word(input_path)
+
+def convert_pdf_to_docx_layout(input_path):
+    # Layout Engine (Good for editing, images, rectangles)
     from pdf2docx import Converter
     output_path = os.path.splitext(input_path)[0] + ".docx"
     cv = Converter(input_path)
     cv.convert(output_path)
     cv.close()
     return output_path
+
+def convert_pdf_to_docx_word(input_path):
+    # Word Engine (Good for OCR/Scans)
+    import win32com.client
+    import pythoncom
+    import shutil
+    import uuid
+    
+    # Initialize COM for this thread
+    pythoncom.CoInitialize()
+    
+    # STRATEGY: Create a temp copy to bypass "Mark of the Web" (Protected View)
+    # which causes "File appears corrupted" errors in automation.
+    temp_dir = os.environ.get('TEMP', os.path.dirname(input_path))
+    temp_pdf_name = f"incinerator_temp_{uuid.uuid4().hex}.pdf"
+    temp_pdf_path = os.path.join(temp_dir, temp_pdf_name)
+    
+    # STRATEGY 3: Sanitize with PyMuPDF (Aggressive Scrub)
+    try:
+        import fitz
+        clean_doc = fitz.open(input_path)
+        # Remove metadata, xml, javascript, embedded files, etc.
+        clean_doc.scrub()
+        clean_doc.save(temp_pdf_path, garbage=4, deflate=True)
+        clean_doc.close()
+    except Exception as e:
+        print(f"Scrub failed: {e}")
+        shutil.copyfile(input_path, temp_pdf_path)
+    
+    word = win32com.client.Dispatch("Word.Application")
+    word.Visible = False
+    word.DisplayAlerts = False
+    
+    doc = None
+    try:
+        # Open the CLEAN RE-SAVED copy
+        doc = word.Documents.Open(
+            FileName=os.path.abspath(temp_pdf_path), 
+            ConfirmConversions=False, 
+            ReadOnly=True, 
+            AddToRecentFiles=False,
+            OpenAndRepair=True
+        )
+        
+        output_path = os.path.splitext(input_path)[0] + ".docx"
+        output_abs = os.path.abspath(output_path)
+        
+        # Save results
+        doc.SaveAs2(output_abs, FileFormat=16)
+        doc.Close()
+        doc = None
+        
+        return output_path
+    except Exception as e:
+        if doc:
+            try:
+                doc.Close(SaveChanges=False)
+            except:
+                pass
+        raise e
+    finally:
+        try:
+             word.Quit()
+        except:
+             pass
+        # Cleanup
+        if os.path.exists(temp_pdf_path):
+            try: os.remove(temp_pdf_path)
+            except: pass
 
 def convert_pdf_to_images(input_path):
     import fitz  # PyMuPDF
@@ -555,9 +644,10 @@ class PerformanceModeManager:
 #  ZONE 2.6: AIRDROP MANAGER (Incinerator Drop)
 # =========================================================
 class AirDropManager:
-    def __init__(self, root, notify_func):
+    def __init__(self, root, notify_func, reveal_func):
         self.root = root
         self.notify = notify_func
+        self.reveal = reveal_func
         self.server_thread = None
         self.app = None
         self.server_running = False
@@ -684,6 +774,7 @@ class AirDropManager:
             # Notify PC
             if count > 0:
                 self.root.after(0, lambda: self.notify("Incinerator Drop", f"Received {count} files."))
+                self.root.after(0, lambda: self.reveal(self.upload_dir))
                 
             return f"""
             <h1 style="color:green; text-align:center; font-family:sans-serif; margin-top:50px;">
@@ -735,7 +826,7 @@ class AntigravityEngine:
         self.osd = OSDManager(self.root)
         
         # 2.2 AirDrop Manager
-        self.airdrop = AirDropManager(self.root, self.notify)
+        self.airdrop = AirDropManager(self.root, self.notify, self.reveal_in_explorer)
         
         # 3. Setup System Tray
         self.setup_tray()
@@ -1129,7 +1220,7 @@ class AntigravityEngine:
         
         # Logic Map
         if ext == '.docx': options = ['pdf']
-        elif ext == '.pdf': options = ['docx', 'images']
+        elif ext == '.pdf': options = ['docx (word)', 'docx (layout)', 'images']
         elif ext in ['.png', '.jpg', '.jpeg', '.webp']:
             options = ['pdf', 'png', 'jpg', 'webp']
             options = [o for o in options if f".{o}" != ext]
@@ -1183,17 +1274,54 @@ class AntigravityEngine:
         # Run in background thread to keep UI smooth
         Thread(target=self._worker, args=(target, path)).start()
 
+    def reveal_in_explorer(self, path):
+        try:
+            path = os.path.normpath(path)
+            subprocess.run(['explorer', '/select,', path])
+        except Exception as e:
+            print(f"Error revealing file: {e}")
+
     def _worker(self, target, path):
         self.notify("Working...", f"Converting to {target}")
         try:
+            output_path = None
             if target == 'pdf':
-                if path.endswith('.docx'): convert_docx_to_pdf(path)
-                else: convert_image_to_pdf(path)
-            elif target == 'docx': convert_pdf_to_docx(path)
-            elif target == 'images': convert_pdf_to_images(path)
-            elif target in ['png', 'jpg', 'webp']: convert_image_format(path, target)
+                if path.endswith('.docx'): 
+                    output_path = convert_docx_to_pdf(path)
+                else: 
+                    output_path = convert_image_to_pdf(path)
+            
+            elif target == 'docx (word)': 
+                output_path = convert_pdf_to_docx_word(path)
+
+            elif target == 'docx (layout)': 
+                output_path = convert_pdf_to_docx_layout(path)
+                
+            elif target == 'images': 
+                # returns folder or string description
+                output_path = convert_pdf_to_images(path) 
+                # If it returns a description string ending in (Images), we might need to find the actual files. 
+                # Looking at convert_pdf_to_images, it saves multiple files and returns a string "{base_path} (Images)".
+                # We should probably just open the folder in that case.
+                if " (Images)" in output_path:
+                    # Just open the directory containing the images
+                    output_path = os.path.dirname(path)
+                    # Or try to select the first image? Let's just open the folder.
+                    # reveal_in_explorer with a folder works too if we don't use /select for folder? 
+                    # actually /select, path works for files. For folder we might just want to open it?
+                    # Let's stick to revealing the source pdf for now or just the folder.
+                    subprocess.run(['explorer', output_path])
+                    self.notify("Success", "Images saved in source folder.")
+                    return
+
+            elif target in ['png', 'jpg', 'webp']: 
+                output_path = convert_image_format(path, target)
             
             self.notify("Success", "File converted.")
+            
+            if output_path and os.path.exists(output_path):
+                self.reveal_in_explorer(output_path)
+                
         except Exception as e:
             self.notify("Error", str(e))
 

@@ -1,0 +1,10 @@
+keyboard
+plyer
+pystray
+Pillow
+docx2pdf
+pdf2docx
+pymupdf
+qrcode
+flask
+pywin32
