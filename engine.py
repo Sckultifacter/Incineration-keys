@@ -11,6 +11,7 @@ from PIL import Image, ImageDraw
 import subprocess
 import ctypes
 
+import psutil
 import json
 import shutil
 import time
@@ -25,11 +26,18 @@ class ConfigManager:
     DEFAULT_CONFIG = {
         "hotkeys": {
             "Trigger Converter": "ctrl+alt+z",
-            "Performance Mode": "ctrl+alt+g",
+            "Performance Mode": "ctrl+alt+p",
+            "Extreme Battery": "ctrl+alt+b",
             "Open": "ctrl+alt+s",
             "Clean Temp": "ctrl+a+delete",
             "Incinerator Drop": "ctrl+alt+d"
         },
+        "battery_kill_list": [
+            "AdobeUpdateService.exe",
+            "OneDrive.exe",
+            "PhoneExperienceHost.exe",
+            "SearchIndexer.exe"
+        ],
         "run_on_startup": True
     }
     
@@ -552,7 +560,337 @@ class PerformanceModeManager:
                user32.SystemParametersInfoW(flag, 0, val, 0x02 | 0x01)
 
 # =========================================================
-#  ZONE 2.6: AIRDROP MANAGER (Incinerator Drop)
+#  ZONE 2.6: BATTERY MODE MANAGER (EXTREME SAVINGS)
+# =========================================================
+class BatteryModeManager:
+    def __init__(self, config_manager):
+        self.config_manager = config_manager
+        self.is_active = False
+        self.prev_brightness = None
+        self.stopped_services = []
+        self.BATTERY_GUID = None
+        
+        # Power Saver Base GUID
+        self.SAVER_GUID = "a1841308-3541-4fab-bc81-f71556f20b4a"
+        
+        self.startupinfo = subprocess.STARTUPINFO()
+        self.startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        self.startupinfo.wShowWindow = 0 
+        self.creation_flags = 0x08000000 
+        
+        # Check if we are already active (persistence check)
+        self._check_initial_state()
+
+    def _run_cmd(self, cmd):
+        try:
+            subprocess.run(shlex.split(cmd), shell=False, 
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                           creationflags=self.creation_flags, startupinfo=self.startupinfo)
+        except: pass
+
+    def _run_ps(self, cmd):
+        try:
+            subprocess.run(["powershell", "-WindowStyle", "Hidden", "-Command", cmd], 
+                           creationflags=self.creation_flags, startupinfo=self.startupinfo)
+        except: pass
+
+    def _get_active_scheme(self):
+        try:
+            out = subprocess.check_output(["powercfg", "/getactivescheme"], creationflags=self.creation_flags, startupinfo=self.startupinfo).decode()
+            return out.split("GUID:")[1].split()[0].strip()
+        except: return None
+        
+    def _is_our_plan(self, guid):
+        try:
+            # List all plans and check if this GUID has our name
+             out = subprocess.check_output(["powercfg", "/list"], creationflags=self.creation_flags, startupinfo=self.startupinfo).decode()
+             for line in out.splitlines():
+                 if guid in line and "Incineration Battery" in line:
+                     return True
+             return False
+        except:
+            return False
+
+    def _check_initial_state(self):
+        current = self._get_active_scheme()
+        if current and self._is_our_plan(current):
+            self.is_active = True
+            self.BATTERY_GUID = current
+            print("Detected active Incineration Battery plan.")
+            # Ensure we don't think "Incineration Battery" is the restore point
+            # Rely on config being correct from previous run
+
+    def _create_battery_plan(self):
+        try:
+            # 1. Duplicate Power Saver
+            out = subprocess.check_output(["powercfg", "/duplicatescheme", self.SAVER_GUID], creationflags=self.creation_flags, startupinfo=self.startupinfo).decode()
+            new_guid = out.split("GUID:")[1].split()[0].strip()
+            
+            self._run_cmd(f"powercfg /changename {new_guid} \"Incineration Battery\"")
+            
+            # 2. Limit CPU to 70%
+            sub_proc = "54533251-82be-4824-96c1-47b60b740d00"
+            max_proc = "bc5038f7-fd9e-4799-a217-a0f48b1b7520"
+            boost_mode = "be337238-0d82-4146-a960-4f3749d470c7"
+            
+            # Set Max CPU to 70%
+            self._run_cmd(f"powercfg /setacvalueindex {new_guid} {sub_proc} {max_proc} 70")
+            self._run_cmd(f"powercfg /setdcvalueindex {new_guid} {sub_proc} {max_proc} 70")
+            
+            # Disable Turbo Boost
+            self._run_cmd(f"powercfg /setacvalueindex {new_guid} {sub_proc} {boost_mode} 0")
+            self._run_cmd(f"powercfg /setdcvalueindex {new_guid} {sub_proc} {boost_mode} 0")
+
+            return new_guid
+        except: return None
+
+    def enable(self, explicit_kill_list=None):
+        self.is_active = True
+        
+        # 1. Save Current State (ONLY if it's not already us)
+        current_scheme = self._get_active_scheme()
+        
+        if current_scheme:
+             if not self._is_our_plan(current_scheme):
+                 # Save reliable restore point
+                 cfg = self.config_manager.load_config()
+                 cfg['last_power_scheme'] = current_scheme
+                 self.config_manager.save_config(cfg)
+             else:
+                 # We are already in our plan. 
+                 # If we are re-enabling (e.g. to update settings), DO NOT OVERWRITE saved config logic.
+                 # Check if config HAS a value. If not, this is bad state.
+                 cfg = self.config_manager.load_config()
+                 if 'last_power_scheme' not in cfg:
+                     # Emergency Fallback: "Balanced" or "High Performance"
+                     # "381b4222-f694-41f0-9685-ff5bb260df2e" is Balanced usually.
+                     cfg['last_power_scheme'] = "381b4222-f694-41f0-9685-ff5bb260df2e"
+                     self.config_manager.save_config(cfg)
+
+        # 2. Create/Set Power Plan
+        # If we already have a GUID active, reuse it or recreate?
+        # Recreating is safer to ensure settings are applied.
+        
+        new_guid = self._create_battery_plan()
+        if new_guid:
+            self._run_cmd(f"powercfg /setactive {new_guid}")
+            
+            # Delete old if it existed and was different (cleanup)
+            if self.BATTERY_GUID and self.BATTERY_GUID != new_guid:
+                try:
+                    self._run_cmd(f"powercfg /delete {self.BATTERY_GUID}")
+                except: pass
+            
+            self.BATTERY_GUID = new_guid
+            
+        # 3. Brightness -> 30%
+        try:
+            out = subprocess.check_output(["powershell", "(Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorBrightness).CurrentBrightness"], creationflags=self.creation_flags, startupinfo=self.startupinfo).decode().strip()
+            if out: self.prev_brightness = int(out)
+            
+            self._run_ps("(Get-WmiObject -Namespace root/wmi -Class WmiMonitorBrightnessMethods).WmiSetBrightness(1, 30)")
+        except: pass
+
+        # 4. Kill Processes
+        targets = set()
+        config_list = self.config_manager.get('battery_kill_list')
+        if config_list:
+            for app in config_list: targets.add(app.lower())
+        if explicit_kill_list:
+            for app in explicit_kill_list: targets.add(app.lower())
+            
+        for proc in psutil.process_iter(['name']):
+            try:
+                if proc.info['name'].lower() in targets:
+                    proc.kill()
+            except: pass
+
+        # 5. Stop Services
+        services_to_stop = ["WSearch", "Spooler", "XblAuthManager", "XblGameSave", "wuauserv", "SysMain"]
+        self.stopped_services = [] 
+        for svc in services_to_stop:
+            try:
+                self._run_cmd(f"net stop {svc}")
+                self.stopped_services.append(svc)
+            except: pass
+
+        # 6. Visuals
+        self._toggle_animations(False)
+
+    def disable(self):
+        self.is_active = False
+        
+        # 1. Restore Power Plan from Config
+        cfg = self.config_manager.load_config()
+        restore_guid = cfg.get('last_power_scheme')
+        
+        if restore_guid:
+            # Check if restore_guid actually exists?
+            # If user deleted plan, we might fail. 
+            self._run_cmd(f"powercfg /setactive {restore_guid}")
+        
+        # Cleanup
+        if self.BATTERY_GUID:
+            time.sleep(0.5)
+            try:
+                # Only delete if we successfully switched away
+                curr = self._get_active_scheme()
+                if curr != self.BATTERY_GUID:
+                    self._run_cmd(f"powercfg /delete {self.BATTERY_GUID}")
+            except: pass
+            self.BATTERY_GUID = None
+
+        # 2. Restore Brightness
+        if self.prev_brightness:
+            time.sleep(0.5) 
+            self._run_ps(f"(Get-WmiObject -Namespace root/wmi -Class WmiMonitorBrightnessMethods).WmiSetBrightness(1, {self.prev_brightness})")
+
+        # 3. Restart Services
+        for svc in self.stopped_services:
+            self._run_cmd(f"net start {svc}")
+        self.stopped_services = []
+
+        # 4. Restore Visuals
+        self._toggle_animations(True)
+
+    def _toggle_animations(self, enable):
+        user32 = ctypes.windll.user32
+        anim_info = ctypes.create_string_buffer(8) # cbSize(4) + iMinAnimate(4)
+        import struct
+        struct.pack_into("II", anim_info, 0, 8, 1 if enable else 0)
+        user32.SystemParametersInfoA(0x0049, 0, anim_info, 0x01 | 0x02)
+
+# =========================================================
+#  ZONE 2.6.5: BATTERY OPTIMIZATION UI (Just-in-Time)
+# =========================================================
+class BatteryOptimizationUI:
+    def __init__(self, root, on_confirm_callback):
+        self.root = root
+        self.on_confirm = on_confirm_callback
+        self.window = None
+
+    def show(self):
+        # Scan for high resources first
+        top_apps = self._scan_apps()
+        if not top_apps:
+            # Nothing significant? Just trigger callback empty
+            self.on_confirm([])
+            return
+
+        self.window = tk.Toplevel(self.root)
+        self.window.title("Incinerate Battery")
+        self.window.overrideredirect(True)
+        self.window.attributes('-topmost', True)
+        self.window.configure(bg="#000000")
+        
+        # Center
+        width, height = 400, 500
+        x = (self.window.winfo_screenwidth() // 2) - (width // 2)
+        y = (self.window.winfo_screenheight() // 2) - (height // 2)
+        self.window.geometry(f"{width}x{height}+{x}+{y}")
+
+        # Border
+        container = tk.Frame(self.window, bg="#ff5500", padx=2, pady=2)
+        container.pack(fill='both', expand=True)
+        
+        frame = tk.Frame(container, bg="#121212", padx=20, pady=20)
+        frame.pack(fill='both', expand=True)
+
+        tk.Label(frame, text="BATTERY OPTIMIZER", fg="#ff5500", bg="#121212", font=("Segoe UI", 14, "bold")).pack(pady=(0, 5))
+        tk.Label(frame, text="Select apps to kill immediately:", fg="#888", bg="#121212", font=("Segoe UI", 10)).pack(pady=(0, 15))
+
+        # List
+        lb_frame = tk.Frame(frame, bg="#121212")
+        lb_frame.pack(fill='both', expand=True)
+        
+        self.vars = {}
+        
+        canvas = tk.Canvas(lb_frame, bg="#121212", highlightthickness=0)
+        scrollbar = tk.Scrollbar(lb_frame, command=canvas.yview, bg="#121212", troughcolor="#121212")
+        scroll_frame = tk.Frame(canvas, bg="#121212")
+
+        scroll_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.create_window((0, 0), window=scroll_frame, anchor="nw", width=340)
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        # Items
+        for app in top_apps:
+            var = tk.BooleanVar(value=True) # Default to Checked for top resource hogs
+            self.vars[app['name']] = var
+            
+            item_frame = tk.Frame(scroll_frame, bg="#121212", pady=5)
+            item_frame.pack(fill='x')
+            
+            # THEME UPDATE: Set selectcolor to Incineration Orange so the checkmark (black) is visible
+            cb = tk.Checkbutton(item_frame, variable=var, 
+                                bg="#121212", activebackground="#121212", 
+                                selectcolor="#ff5500") 
+            cb.pack(side='left')
+            
+            info = f"{app['name']}"
+            if app['mem_mb'] > 0: info += f"\n{app['mem_mb']} MB RAM"
+            
+            tk.Label(item_frame, text=info, fg="white", bg="#121212", font=("Consolas", 10), justify="left").pack(side='left', padx=10)
+
+        # Buttons
+        btn_frame = tk.Frame(frame, bg="#121212")
+        btn_frame.pack(fill='x', pady=20)
+
+        tk.Button(btn_frame, text="INCINERATE ALL", command=lambda: self._done(True), 
+                  bg="#ff5500", fg="white", relief="flat", font=("Segoe UI", 10, "bold"), pady=10).pack(fill='x', pady=(0, 10))
+                  
+        tk.Button(btn_frame, text="SKIP CLEANUP", command=lambda: self._done(False), 
+                  bg="#222", fg="#888", relief="flat", font=("Segoe UI", 10), pady=8).pack(fill='x')
+
+        self.window.focus_force()
+
+    def _scan_apps(self):
+        # Uses psutil to find high resource apps
+        apps = []
+        try:
+            for p in psutil.process_iter(['name', 'memory_info', 'status']):
+                try:
+                    # Filter for GUI apps or High Mem
+                    if p.info['status'] == psutil.STATUS_RUNNING and p.info['memory_info'].rss > 100 * 1024 * 1024: # > 100MB
+                         # Ignore system criticals (simple filter)
+                         if p.info['name'].lower() in ['explorer.exe', 'python.exe', 'incinerationkeys.exe']: continue
+                         
+                         apps.append({
+                             'name': p.info['name'],
+                             'mem_mb': int(p.info['memory_info'].rss / 1024 / 1024)
+                         })
+                except: pass
+        except: pass
+        
+        # Sort by Memory
+        apps.sort(key=lambda x: x['mem_mb'], reverse=True)
+        return apps[:15] # Top 15
+
+    def _done(self, incinerate):
+        kill_list = []
+        if incinerate:
+            for name, var in self.vars.items():
+                if var.get():
+                    kill_list.append(name)
+        
+        self.window.destroy()
+        self.on_confirm(kill_list)
+
+    def _toggle_animations(self, enable):
+        user32 = ctypes.windll.user32
+        anim_info = ctypes.create_string_buffer(8) # cbSize(4) + iMinAnimate(4)
+        import struct
+        struct.pack_into("II", anim_info, 0, 8, 1 if enable else 0)
+        user32.SystemParametersInfoA(0x0049, 0, anim_info, 0x01 | 0x02)
+
+# =========================================================
+#  ZONE 2.7: AIRDROP MANAGER (Incinerator Drop)
 # =========================================================
 class AirDropManager:
     def __init__(self, root, notify_func):
@@ -721,6 +1059,7 @@ class AntigravityEngine:
     def __init__(self):
         self.config_manager = ConfigManager()
         self.performance_manager = PerformanceModeManager()
+        self.battery_manager = BatteryModeManager(self.config_manager)
         
         # 1. Startup Check
         if self.config_manager.get('run_on_startup'):
@@ -772,6 +1111,12 @@ class AntigravityEngine:
                 elif action_name == "Performance Mode":
                     try:
                         keyboard.add_hotkey(hotkey, lambda: self.safe_trigger(self.toggle_performance_mode))
+                        print(f"Registered '{action_name}' to {hotkey}")
+                    except Exception as e:
+                        print(f"Failed to register '{action_name}': {e}")
+                elif action_name == "Extreme Battery":
+                    try:
+                        keyboard.add_hotkey(hotkey, lambda: self.safe_trigger(self.toggle_battery_mode))
                         print(f"Registered '{action_name}' to {hotkey}")
                     except Exception as e:
                         print(f"Failed to register '{action_name}': {e}")
@@ -957,7 +1302,7 @@ class AntigravityEngine:
         btn_apply.bind("<Leave>", on_leave_apply)
 
         def on_enter_cancel(e): btn_cancel['bg'] = '#333'; btn_cancel['fg'] = 'white'
-        def on_leave_cancel(e): btn_cancel['bg'] = '#222'; btn_cancel['fg'] = '#aaa'
+        def on_leave_cancel(e): btn_cancel['bg'] = '#222'; btn_cancel['fg'] = '#ccc'
         btn_cancel.bind("<Enter>", on_enter_cancel)
         btn_cancel.bind("<Leave>", on_leave_cancel)
 
@@ -1298,6 +1643,24 @@ class AntigravityEngine:
         except Exception as e:
             self.notify("Mode Error", str(e))
             print(f"Performance Toggle Failed: {e}")
+
+    def toggle_battery_mode(self):
+        try:
+            if self.battery_manager.is_active:
+                self.battery_manager.disable()
+                self.osd.show(text="Standard Power", title="BATTERY MODE", duration=2500)
+            else:
+                # Launch UI first
+                def on_confirm(kill_list):
+                    self.battery_manager.enable(explicit_kill_list=kill_list)
+                    self.osd.show(text="Extreme Savings Enabled", title="BATTERY MODE", duration=3000)
+                
+                ui = BatteryOptimizationUI(self.root, on_confirm)
+                self.root.after(0, ui.show)
+                
+        except Exception as e:
+            self.notify("Battery Error", str(e))
+            print(f"Battery Toggle Failed: {e}")
 
     def clean_temp_files(self):
         self.notify("Incinerator", "Cleaning Temp Files...")
