@@ -2,7 +2,9 @@
     "hotkeys": {
         "Trigger Converter": "ctrl+alt+z",
         "Performance Mode": "ctrl+alt+p",
-        "Open": "ctrl+alt+o"
+        "Open": "ctrl+alt+o",
+        "Clean Temp": "ctrl+a+delete",
+        "Incinerator Drop": "ctrl+alt+d"
     },
     "run_on_startup": true
 }
